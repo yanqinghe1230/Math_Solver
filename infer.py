@@ -1,7 +1,7 @@
 import json
 import torch
 from tqdm import tqdm
-from modelscope import AutoTokenizer
+from transformers import AutoTokenizer
 from transformers import AutoModelForCausalLM
 from peft import PeftModel
 
