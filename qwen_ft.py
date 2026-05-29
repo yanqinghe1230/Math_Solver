@@ -69,6 +69,8 @@ args = TrainingArguments(
     report_to="none",
 )
 
+swanlab.init(mode="local")
+
 swanlab_callback = SwanLabCallback(
     project="Qwen2.5-0.5B-fintune",
     experiment_name="Qwen/Qwen2.5-0.5B-Instruct",
