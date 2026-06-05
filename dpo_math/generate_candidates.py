@@ -37,8 +37,6 @@ import random
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Optional
-
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -54,13 +52,11 @@ from config import (
     ZHIPU_API_KEY_ENV,
     MAX_TOKENS,
     MIN_DELAY_BETWEEN_CALLS,
-    MAX_RETRIES,
-    RETRY_BASE_DELAY,
     SAVE_INTERVAL,
     MIN_RESPONSE_LENGTH,
 )
 from prompts import build_messages, get_strategy_temperature
-from answer_verifier import extract_final_answer, extract_ground_truth, is_answer_wrong, generate_wrong_cot
+from answer_verifier import extract_final_answer, extract_ground_truth, is_answer_wrong
 
 # Load .env file
 load_dotenv()
@@ -90,8 +86,6 @@ def load_checkpoint() -> dict:
         "total_api_calls": 0,
         "total_pairs_generated": 0,
         "total_skipped_no_cot": 0,
-        "total_no_rejected": 0,
-        "total_fallback_pairs": 0,
         "started_at": None,
         "last_updated": None,
     }
@@ -124,41 +118,19 @@ def call_api(
     messages: list[dict],
     temperature: float,
     model: str = ZHIPU_MODEL,
-    max_retries: int = MAX_RETRIES,
-) -> Optional[str]:
+) -> str:
     """
-    Call Zhipu API with simple retry on failure.
+    Call Zhipu API. No retry — any failure raises immediately and stops the program.
 
-    Returns response text, or None on persistent failure.
+    Returns response text.
     """
-    for attempt in range(max_retries):
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=MAX_TOKENS,
-                temperature=temperature,
-            )
-            return response.choices[0].message.content
-
-        except Exception as e:
-            err_msg = str(e)
-            # Rate limit — wait and retry
-            if "429" in err_msg or "rate" in err_msg.lower():
-                wait = RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 1)
-                log(f"  Rate limited, waiting {wait:.1f}s (attempt {attempt+1}/{max_retries})")
-                time.sleep(wait)
-            # Server error — wait and retry
-            elif "5" in err_msg[:10] if len(err_msg) >= 10 else "5" in err_msg:
-                wait = RETRY_BASE_DELAY * (2 ** attempt)
-                log(f"  Server error, waiting {wait:.1f}s (attempt {attempt+1}/{max_retries})")
-                time.sleep(wait)
-            # Other errors
-            else:
-                log(f"  API error (attempt {attempt+1}/{max_retries}): {e}")
-                time.sleep(RETRY_BASE_DELAY)
-
-    return None
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        max_tokens=MAX_TOKENS,
+        temperature=temperature,
+    )
+    return response.choices[0].message.content
 
 
 # ── Question preprocessing ──
@@ -202,16 +174,6 @@ def try_generate_wrong(
     time.sleep(MIN_DELAY_BETWEEN_CALLS)
     response_text = call_api(client, messages, temperature, model=model)
 
-    if response_text is None:
-        return {
-            "strategy": STRATEGY_NAME,
-            "temperature": temperature,
-            "generated_text": None,
-            "extracted_answer": None,
-            "is_wrong": None,
-            "status": "api_failed",
-        }
-
     extracted = extract_final_answer(response_text)
     is_wrong = None
     status = "unknown"
@@ -228,9 +190,9 @@ def try_generate_wrong(
             status = "cannot_determine"
 
     # Quality checks
-    if response_text and len(response_text) < MIN_RESPONSE_LENGTH:
+    if len(response_text) < MIN_RESPONSE_LENGTH:
         status = "too_short"
-    if response_text and response_text.rstrip().endswith(("，", "（", "(")):
+    if response_text.rstrip().endswith(("，", "（", "(")):
         status = "possibly_truncated"
 
     return {
@@ -272,7 +234,7 @@ def generate(
         checkpoint["started_at"] = datetime.now(timezone.utc).isoformat()
 
     # Initialize missing checkpoint fields
-    for key in ("total_skipped_no_cot", "total_no_rejected", "total_fallback_pairs"):
+    for key in ("total_skipped_no_cot",):
         if key not in checkpoint:
             checkpoint[key] = 0
 
@@ -282,15 +244,12 @@ def generate(
     total_api_calls = checkpoint["total_api_calls"]
     processed = checkpoint["total_processed"]
     skipped_no_cot = checkpoint["total_skipped_no_cot"]
-    no_rejected = checkpoint["total_no_rejected"]
-    fallback_pairs = checkpoint["total_fallback_pairs"]
 
     total_problems = len(problems)
     end_index = start_index + total_problems - 1
 
     log(f"Starting from index {start_index}, {total_problems} problems to process")
-    log(f"Resume: {processed} done, {total_api_calls} API calls, {total_pairs} pairs "
-        f"({fallback_pairs} fallback)")
+    log(f"Resume: {processed} done, {total_api_calls} API calls, {total_pairs} pairs")
 
     for i, record in enumerate(problems):
         problem_idx = start_index + i
@@ -319,8 +278,7 @@ def generate(
                 checkpoint.update({
                     "last_processed_index": problem_idx, "total_processed": processed,
                     "total_api_calls": total_api_calls, "total_pairs_generated": total_pairs,
-                    "total_skipped_no_cot": skipped_no_cot, "total_no_rejected": no_rejected,
-                    "total_fallback_pairs": fallback_pairs,
+                    "total_skipped_no_cot": skipped_no_cot,
                 })
                 save_checkpoint(checkpoint)
             continue
@@ -350,37 +308,14 @@ def generate(
             extracted = gen_record["extracted_answer"]
             log(f"  ✓ WRONG: {extracted} (gt: {ground_truth})")
         elif status == "same_answer":
-            log(f"  correct (same as gt)")
-        elif status == "api_failed":
-            log(f"  API FAILED")
+            log(f"  answer correct but COT may be unreliable — keeping as rejected")
+        elif status == "unparseable":
+            log(f"  unparseable answer — keeping as rejected")
         else:
-            log(f"  {status}")
+            log(f"  {status} — keeping as rejected")
 
-        # ── Determine rejected source ──
-        if gen_record["is_wrong"] is True:
-            rejected_candidates = [gen_record]
-            rejected_source = "api"
-        else:
-            rejected_candidates = []
-            # ── Fallback: programmatically generate a wrong CoT ──
-            wrong_cot = generate_wrong_cot(answer_full)
-            if wrong_cot:
-                fallback_gen = {
-                    "strategy": "fallback_programmatic",
-                    "temperature": 0,
-                    "generated_text": wrong_cot,
-                    "extracted_answer": extract_ground_truth(wrong_cot),
-                    "is_wrong": True,
-                    "status": "rejected_candidate",
-                    "round": 0,
-                }
-                rejected_candidates.append(fallback_gen)
-                all_generations.append(fallback_gen)
-                rejected_source = "fallback"
-                fallback_pairs += 1
-                log(f"  ⚡ FALLBACK: programmatic wrong answer generated")
-            else:
-                rejected_source = "none"
+        # ── Always use the API response as rejected (COT may be unreliable) ──
+        rejected_source = "api"
 
         # Write intermediate result to JSONL
         candidate_record = {
@@ -389,33 +324,28 @@ def generate(
             "ground_truth_answer": ground_truth,
             "ground_truth_cot": answer_full,
             "generations": all_generations,
-            "has_rejected": len(rejected_candidates) > 0,
+            "has_rejected": True,
             "rejected_source": rejected_source,
         }
         candidates_file.write(json.dumps(candidate_record, ensure_ascii=False) + "\n")
         candidates_file.flush()
 
-        # Write DPO pair
-        if rejected_candidates:
-            rejected = rejected_candidates[0]
-            pair = {
-                "prompt": [{"role": "user", "content": question}],
-                "chosen": [{"role": "assistant", "content": answer_full}],
-                "rejected": [{"role": "assistant", "content": rejected["generated_text"]}],
-                "metadata": {
-                    "problem_id": problem_id,
-                    "rejected_strategy": rejected["strategy"],
-                    "ground_truth": ground_truth,
-                    "rejected_answer": rejected.get("extracted_answer"),
-                    "source": rejected_source,
-                },
-            }
-            with open(OUTPUT_PATH, "a", encoding="utf-8") as pf:
-                pf.write(json.dumps(pair, ensure_ascii=False) + "\n")
-            total_pairs += 1
-        else:
-            no_rejected += 1
-            log(f"  ⚠ NO REJECTED: API call did not produce a wrong answer")
+        # Write DPO pair — always from API response
+        pair = {
+            "prompt": [{"role": "user", "content": question}],
+            "chosen": [{"role": "assistant", "content": answer_full}],
+            "rejected": [{"role": "assistant", "content": gen_record["generated_text"]}],
+            "metadata": {
+                "problem_id": problem_id,
+                "rejected_strategy": gen_record["strategy"],
+                "ground_truth": ground_truth,
+                "rejected_answer": gen_record.get("extracted_answer"),
+                "source": rejected_source,
+            },
+        }
+        with open(OUTPUT_PATH, "a", encoding="utf-8") as pf:
+            pf.write(json.dumps(pair, ensure_ascii=False) + "\n")
+        total_pairs += 1
 
         processed += 1
 
@@ -427,12 +357,10 @@ def generate(
                 "total_api_calls": total_api_calls,
                 "total_pairs_generated": total_pairs,
                 "total_skipped_no_cot": skipped_no_cot,
-                "total_no_rejected": no_rejected,
-                "total_fallback_pairs": fallback_pairs,
             })
             save_checkpoint(checkpoint)
             log(f"  ── Checkpoint: {processed} processed, {total_api_calls} calls, "
-                f"{total_pairs} pairs ({fallback_pairs} fb), {no_rejected} no-rej ──")
+                f"{total_pairs} pairs ──")
 
     # Final checkpoint
     checkpoint.update({
@@ -441,8 +369,6 @@ def generate(
         "total_api_calls": total_api_calls,
         "total_pairs_generated": total_pairs,
         "total_skipped_no_cot": skipped_no_cot,
-        "total_no_rejected": no_rejected,
-        "total_fallback_pairs": fallback_pairs,
     })
     save_checkpoint(checkpoint)
 
@@ -462,8 +388,6 @@ def print_summary(checkpoint: dict):
         ("total_skipped_no_cot", "Skipped (no CoT)"),
         ("total_api_calls", "Total API calls"),
         ("total_pairs_generated", "DPO pairs generated"),
-        ("total_fallback_pairs", "  of which fallback"),
-        ("total_no_rejected", "No rejected found"),
     ]:
         val = checkpoint.get(key, "N/A")
         print(f"  {label}: {val}", file=sys.stderr)
