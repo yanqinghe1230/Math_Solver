@@ -12,6 +12,7 @@ Handles the diverse answer formats found in Chinese elementary math problems:
 - Numbers with units: 315千克, 7元
 """
 
+import random
 import re
 from typing import Optional, Union
 
@@ -269,3 +270,393 @@ def extract_ground_truth(answer_text: str) -> str:
 
     # Fallback for non-standard records
     return extract_final_answer(answer_text) or answer_text.strip()
+
+
+# ── Programmatic wrong answer generation (fallback) ──
+
+def generate_wrong_cot(correct_cot: str) -> Optional[str]:
+    """
+    Programmatically generate a wrong variant of a correct CoT answer.
+
+    Used as a last-resort fallback when the API cannot produce wrong answers
+    (e.g., for very simple problems like '105 × 3 = ?').
+
+    Applies one of several error strategies to make the reasoning internally
+    consistent but ultimately arrive at an incorrect final answer.
+
+    Returns the modified CoT text, or None if no transformation could be applied.
+    """
+    if not correct_cot or len(correct_cot) < 30:
+        return None
+
+    # Try strategies in random order until one succeeds
+    strategies = [
+        _error_arithmetic,
+        _error_operator_swap,
+        _error_number_shift,
+        _error_missing_step,
+        _error_wrong_operand,
+    ]
+    random.shuffle(strategies)
+
+    for strategy_fn in strategies:
+        result = strategy_fn(correct_cot)
+        if result is not None and result != correct_cot:
+            # Verify the result actually has a different final answer
+            correct_gt = extract_ground_truth(correct_cot)
+            wrong_gt = extract_ground_truth(result)
+            if wrong_gt and is_answer_wrong(correct_gt, wrong_gt):
+                return result
+
+    return None
+
+
+# ── Error strategies ──
+
+def _error_arithmetic(cot: str) -> Optional[str]:
+    """
+    Find a calculation like 'X op Y = Z' and change Z to a wrong value
+    while keeping the reasoning flow consistent.
+    """
+    # Match patterns like: "105 × 3 = 315" or "150 ÷ 5 = 30"
+    pattern = re.compile(r'(\d+(?:\.\d+)?)\s*([×÷+\-])\s*(\d+(?:\.\d+)?)\s*=\s*(\d+(?:\.\d+)?)')
+    matches = list(pattern.finditer(cot))
+    if not matches:
+        return None
+
+    # Pick a match (prefer the last one — usually closest to final answer)
+    match = random.choice(matches)
+    a, op, b, correct_result = match.group(1), match.group(2), match.group(3), match.group(4)
+
+    # Compute wrong result
+    a_val = float(a)
+    b_val = float(b)
+    correct_val = float(correct_result)
+
+    # Generate a plausible wrong answer
+    wrong_val = _plausible_wrong(a_val, b_val, op, correct_val)
+    if wrong_val is None:
+        return None
+
+    # Format the wrong result the same way as the original
+    if '.' in correct_result:
+        wrong_str = f"{wrong_val:.1f}" if wrong_val == int(wrong_val) else str(round(wrong_val, 2))
+    elif correct_result.endswith('/') or '/' in str(correct_val):
+        wrong_str = str(int(wrong_val))
+    else:
+        wrong_str = str(int(wrong_val))
+
+    # Replace just this occurrence
+    old = f"{a} {op} {b} = {correct_result}"
+    new = f"{a} {op} {b} = {wrong_str}"
+    cot = cot.replace(old, new, 1)
+
+    # Also update any downstream calculation that uses the wrong result
+    # Find the final answer and replace it
+    correct_gt = extract_ground_truth(cot)  # This won't work because we just changed the calc but not the final answer yet
+
+    # Actually, let's update the final answer section
+    cot = _update_final_answer(cot, wrong_str)
+
+    return cot
+
+
+def _error_operator_swap(cot: str) -> Optional[str]:
+    """
+    Swap an arithmetic operator: × → +, ÷ → -, + → ×.
+    Then recalculate the result accordingly.
+    """
+    # Find a calculation with an operator we can swap
+    pattern = re.compile(r'(\d+(?:\.\d+)?)\s*([×÷+\-])\s*(\d+(?:\.\d+)?)\s*=\s*(\d+(?:\.\d+)?)')
+    matches = list(pattern.finditer(cot))
+    if not matches:
+        return None
+
+    match = random.choice(matches)
+    a, op, b, correct_result = match.group(1), match.group(2), match.group(3), match.group(4)
+    a_val, b_val = float(a), float(b)
+
+    # Swap operators
+    swaps = {'×': '+', '+': '×', '÷': '-', '-': '÷'}
+    if op not in swaps:
+        return None
+    new_op = swaps[op]
+
+    # Compute with the new operator
+    try:
+        if new_op == '+':
+            wrong_val = a_val + b_val
+        elif new_op == '×':
+            wrong_val = a_val * b_val
+        elif new_op == '-':
+            wrong_val = a_val - b_val
+        elif new_op == '÷':
+            wrong_val = a_val / b_val if b_val != 0 else a_val
+        else:
+            return None
+    except (ValueError, ZeroDivisionError):
+        return None
+
+    if wrong_val == float(correct_result):
+        return None  # No actual change
+
+    # Format
+    wrong_str = str(int(wrong_val)) if wrong_val == int(wrong_val) else f"{wrong_val:.1f}"
+
+    old = f"{a} {op} {b} = {correct_result}"
+    new = f"{a} {new_op} {b} = {wrong_str}"
+    cot = cot.replace(old, new, 1)
+    cot = _update_final_answer(cot, wrong_str)
+
+    return cot
+
+
+def _error_number_shift(cot: str) -> Optional[str]:
+    """
+    Shift one of the input numbers slightly: 105 → 150, 150 → 105,
+    120 → 102, then recalculate.
+    """
+    # Find a number that looks like it came from the problem
+    pattern = re.compile(r'(\d+(?:\.\d+)?)\s*([×÷+\-])\s*(\d+(?:\.\d+)?)\s*=\s*(\d+(?:\.\d+)?)')
+    matches = list(pattern.finditer(cot))
+    if not matches:
+        return None
+
+    match = random.choice(matches)
+    a, op, b, correct_result = match.group(1), match.group(2), match.group(3), match.group(4)
+    a_val, b_val = float(a), float(b)
+
+    # Decide which operand to shift (a or b)
+    if random.random() < 0.5 and len(a) >= 2:
+        # Digit swap: 105 → 150, 120 → 102
+        new_a = _digit_swap(a)
+        if new_a == a:
+            return None
+        a_val, new_str = float(new_a), new_a
+        old_target, new_target = a, new_a
+    elif len(b) >= 2:
+        new_b = _digit_swap(b)
+        if new_b == b:
+            return None
+        b_val, new_str = float(new_b), new_b
+        old_target, new_target = b, new_b
+    else:
+        return None
+
+    # Recalculate
+    try:
+        if op == '×':
+            wrong_val = a_val * b_val
+        elif op == '+':
+            wrong_val = a_val + b_val
+        elif op == '-':
+            wrong_val = a_val - b_val
+        elif op == '÷':
+            wrong_val = a_val / b_val if b_val != 0 else a_val
+        else:
+            return None
+    except (ValueError, ZeroDivisionError):
+        return None
+
+    wrong_str = str(int(wrong_val)) if wrong_val == int(wrong_val) else f"{wrong_val:.1f}"
+
+    old = f"{old_target} {op} {match.group(3) if old_target == a else match.group(1)} = {correct_result}"
+    new = f"{new_target} {op} {match.group(3) if old_target == a else match.group(1)} = {wrong_str}"
+    cot = cot.replace(old, new, 1)
+    cot = _update_final_answer(cot, wrong_str)
+
+    return cot
+
+
+def _error_missing_step(cot: str) -> Optional[str]:
+    """
+    Remove one reasoning step and adjust the final answer.
+    Works by removing a numbered step line and replacing the answer
+    with a value computed from the preceding step.
+    """
+    # Find numbered steps
+    lines = cot.split('\n')
+    step_pattern = re.compile(r'^\d+\.\s')
+    step_indices = [i for i, line in enumerate(lines) if step_pattern.match(line.strip())]
+
+    if len(step_indices) < 2:
+        return None
+
+    # Remove a middle step
+    remove_idx = random.choice(step_indices[1:-1] if len(step_indices) > 2 else step_indices[1:])
+    lines.pop(remove_idx)
+
+    # Re-number remaining steps
+    new_lines = []
+    step_num = 1
+    for line in lines:
+        stripped = line.strip()
+        if step_pattern.match(stripped):
+            # Replace the step number
+            new_line = re.sub(r'^\d+\.', f'{step_num}.', stripped, count=1)
+            new_lines.append(new_line)
+            step_num += 1
+        else:
+            new_lines.append(stripped)
+
+    # Find the most recent calculation before the 最终答案 section
+    # and use a different value as the final answer
+    cot_modified = '\n'.join(new_lines)
+
+    # Extract the last number in the reasoning
+    reasoning_nums = re.findall(r'=\s*(\d+(?:\.\d+)?)', cot_modified)
+    if reasoning_nums:
+        last_calc = float(reasoning_nums[-1])
+        # Offset it slightly
+        wrong_val = last_calc + random.choice([-1, 1, -10, 10, -5, 5])
+        if wrong_val <= 0:
+            wrong_val = last_calc * random.choice([0.5, 0.8, 1.2, 1.5])
+        wrong_str = str(int(wrong_val)) if wrong_val == int(wrong_val) else f"{wrong_val:.1f}"
+        cot_modified = _update_final_answer(cot_modified, wrong_str)
+        return cot_modified
+
+    return None
+
+
+def _error_wrong_operand(cot: str) -> Optional[str]:
+    """
+    Use a wrong operand value: pick a number from elsewhere in the problem
+    instead of the correct one. This is the most subtle and natural-looking error.
+    """
+    # Find all calculations: "A op B = C"
+    calc_pattern = re.compile(r'(\d+(?:\.\d+)?)\s*([×÷+\-])\s*(\d+(?:\.\d+)?)\s*=\s*(\d+(?:\.\d+)?)')
+    calc_matches = list(calc_pattern.finditer(cot))
+    if not calc_matches:
+        return None
+
+    # Find all standalone numbers in the reasoning
+    all_numbers = re.findall(r'(?<!\d)(\d+(?:\.\d+)?)(?!\d)', cot)
+    if len(all_numbers) < 3:
+        return None
+
+    # Pick a random calculation
+    match = random.choice(calc_matches)
+    a, op, b, result = match.group(1), match.group(2), match.group(3), match.group(4)
+    a_val, b_val = float(a), float(b)
+
+    # Pick a replacement number different from a, b, and result
+    candidates = [n for n in all_numbers if n != a and n != b and n != result]
+    if not candidates:
+        return None
+
+    replacement = random.choice(candidates)
+    repl_val = float(replacement)
+
+    # Decide which operand to replace
+    if random.random() < 0.5:
+        # Replace a
+        a_val, old_target, new_target = repl_val, a, replacement
+    else:
+        # Replace b
+        b_val, old_target, new_target = repl_val, b, replacement
+
+    # Recalculate with the wrong operand
+    try:
+        if op == '×':
+            wrong_val = a_val * b_val
+        elif op == '+':
+            wrong_val = a_val + b_val
+        elif op == '-':
+            wrong_val = a_val - b_val
+        elif op == '÷':
+            wrong_val = a_val / b_val if b_val != 0 else a_val
+        else:
+            return None
+    except (ValueError, ZeroDivisionError):
+        return None
+
+    if wrong_val == float(result):
+        return None  # No change
+
+    wrong_str = str(int(wrong_val)) if wrong_val == int(wrong_val) else f"{wrong_val:.1f}"
+
+    # Replace the old operand with new operand in the matched span
+    full_match = match.group(0)
+    if old_target == a:
+        new_calc = f"{new_target} {op} {b} = {wrong_str}"
+    else:
+        new_calc = f"{a} {op} {new_target} = {wrong_str}"
+
+    cot = cot.replace(full_match, new_calc, 1)
+    cot = _update_final_answer(cot, wrong_str)
+    return cot
+
+
+# ── Helpers ──
+
+def _plausible_wrong(a: float, b: float, op: str, correct: float) -> Optional[float]:
+    """
+    Generate a plausible wrong answer by introducing a common arithmetic error.
+    """
+    candidates = []
+
+    # Off-by-one in one digit of the result
+    if correct != 0:
+        candidates.append(correct + 1)
+        candidates.append(correct - 1)
+
+    # Digit transposition (e.g., 315 → 351, 135, 513)
+    correct_int = int(correct)
+    if correct == correct_int and correct_int >= 10:
+        s = str(correct_int)
+        if len(s) >= 3:
+            # Swap adjacent digits
+            i = random.randint(0, len(s) - 2)
+            swapped = s[:i] + s[i+1] + s[i] + s[i+2:]
+            if swapped != s:
+                candidates.append(float(swapped))
+
+    # Multiplication by wrong factor
+    if op == '×':
+        candidates.append(a * (b + random.choice([-2, -1, 1, 2])))
+    elif op == '+':
+        candidates.append(a + b + random.choice([-1, 1, -10, 10]))
+    elif op == '-':
+        candidates.append(abs(a - b + random.choice([-1, 1, -5, 5])))
+
+    # Remove candidates that equal the correct answer
+    candidates = [c for c in candidates if c != correct and c > 0]
+
+    if not candidates:
+        return correct + random.choice([1, 2, 5, -1, -2, -5])
+
+    return random.choice(candidates)
+
+
+def _digit_swap(s: str) -> str:
+    """Swap two adjacent digits in a number string."""
+    if len(s) < 2:
+        return s
+    i = random.randint(0, len(s) - 2)
+    return s[:i] + s[i+1] + s[i] + s[i+2:]
+
+
+def _update_final_answer(cot: str, new_answer: str) -> str:
+    """
+    Replace the final answer in a CoT text with a new value.
+    Handles the standard ### 最终答案 format.
+    """
+    # Pattern: ### 最终答案\n{value}
+    m = re.search(r'(#*\s*最终答案\s*\n\s*)(.+?)(\s*)$', cot, re.MULTILINE | re.DOTALL)
+    if m:
+        before = cot[:m.start(2)]
+        after = cot[m.end(2):]
+        return before + new_answer + after
+
+    # Pattern: 最终答案是/為 {value}
+    m = re.search(r'(最终答案[是为：:]\s*)(.+?)(\n|$)', cot)
+    if m:
+        before = cot[:m.start(2)]
+        after = cot[m.end(2):]
+        return before + new_answer + after
+
+    # Fallback: append a wrong final answer line
+    if '最终答案' not in cot and '推理过程' in cot:
+        return cot.rstrip() + f"\n\n### 最终答案\n{new_answer}"
+
+    return cot

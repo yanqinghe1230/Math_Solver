@@ -63,7 +63,7 @@ from config import (
     MIN_RESPONSE_LENGTH,
 )
 from prompts import build_messages, get_strategy_temperature, STRATEGIES
-from answer_verifier import extract_final_answer, extract_ground_truth, is_answer_wrong
+from answer_verifier import extract_final_answer, extract_ground_truth, is_answer_wrong, generate_wrong_cot
 
 # Load .env file
 load_dotenv()
@@ -91,6 +91,7 @@ def load_checkpoint() -> dict:
         "total_pairs_generated": 0,
         "total_skipped_no_cot": 0,
         "total_no_rejected": 0,
+        "total_fallback_pairs": 0,
         "started_at": None,
         "last_updated": None,
     }
@@ -314,7 +315,7 @@ def generate(
         checkpoint["started_at"] = datetime.now(timezone.utc).isoformat()
 
     # Initialize missing checkpoint fields
-    for key in ("total_skipped_no_cot", "total_no_rejected"):
+    for key in ("total_skipped_no_cot", "total_no_rejected", "total_fallback_pairs"):
         if key not in checkpoint:
             checkpoint[key] = 0
 
@@ -325,6 +326,7 @@ def generate(
     processed = checkpoint["total_processed"]
     skipped_no_cot = checkpoint["total_skipped_no_cot"]
     no_rejected = checkpoint["total_no_rejected"]
+    fallback_pairs = checkpoint["total_fallback_pairs"]
 
     total_problems = len(problems)
     end_index = start_index + total_problems - 1
@@ -361,6 +363,7 @@ def generate(
                     "last_processed_index": problem_idx, "total_processed": processed,
                     "total_api_calls": total_api_calls, "total_pairs_generated": total_pairs,
                     "total_skipped_no_cot": skipped_no_cot, "total_no_rejected": no_rejected,
+                    "total_fallback_pairs": fallback_pairs,
                 })
                 save_checkpoint(checkpoint)
             continue
@@ -384,6 +387,7 @@ def generate(
         all_generations = []
         rejected_candidates = []
         tried_strategies = set()
+        round_num = 0  # track outside loop
 
         for round_num in range(max_retry_rounds):
             # Select fresh strategies (exclude already-tried ones within this problem)
@@ -422,6 +426,30 @@ def generate(
             if rejected_candidates:
                 break
 
+        # ── Determine rejected source ──
+        if rejected_candidates:
+            rejected_source = "api"
+        else:
+            # ── Fallback: programmatically generate a wrong CoT ──
+            wrong_cot = generate_wrong_cot(answer_full)
+            if wrong_cot:
+                fallback_gen = {
+                    "strategy": "fallback_programmatic",
+                    "temperature": 0,
+                    "generated_text": wrong_cot,
+                    "extracted_answer": extract_ground_truth(wrong_cot),
+                    "is_wrong": True,
+                    "status": "rejected_candidate",
+                    "round": 0,
+                }
+                rejected_candidates.append(fallback_gen)
+                all_generations.append(fallback_gen)
+                rejected_source = "fallback"
+                fallback_pairs += 1
+                log(f"  ⚡ FALLBACK: programmatic wrong answer generated")
+            else:
+                rejected_source = "none"
+
         # Write intermediate result to JSONL
         candidate_record = {
             "id": problem_id,
@@ -431,11 +459,12 @@ def generate(
             "generations": all_generations,
             "total_rounds": round_num + 1,
             "has_rejected": len(rejected_candidates) > 0,
+            "rejected_source": rejected_source,
         }
         candidates_file.write(json.dumps(candidate_record, ensure_ascii=False) + "\n")
         candidates_file.flush()
 
-        # Write DPO pair if we got a rejected answer
+        # Write DPO pair
         if rejected_candidates:
             rejected = rejected_candidates[0]
             pair = {
@@ -446,8 +475,8 @@ def generate(
                     "problem_id": problem_id,
                     "rejected_strategy": rejected["strategy"],
                     "ground_truth": ground_truth,
-                    "rejected_answer": rejected["extracted_answer"],
-                    "round": rejected.get("round", 1),
+                    "rejected_answer": rejected.get("extracted_answer"),
+                    "source": rejected_source,
                 },
             }
             with open(OUTPUT_PATH, "a", encoding="utf-8") as pf:
@@ -468,10 +497,11 @@ def generate(
                 "total_pairs_generated": total_pairs,
                 "total_skipped_no_cot": skipped_no_cot,
                 "total_no_rejected": no_rejected,
+                "total_fallback_pairs": fallback_pairs,
             })
             save_checkpoint(checkpoint)
             log(f"  ── Checkpoint: {processed} processed, {total_api_calls} calls, "
-                f"{total_pairs} pairs, {no_rejected} no-rejected ──")
+                f"{total_pairs} pairs ({fallback_pairs} fb), {no_rejected} no-rej ──")
 
     # Final checkpoint
     checkpoint.update({
@@ -481,6 +511,7 @@ def generate(
         "total_pairs_generated": total_pairs,
         "total_skipped_no_cot": skipped_no_cot,
         "total_no_rejected": no_rejected,
+        "total_fallback_pairs": fallback_pairs,
     })
     save_checkpoint(checkpoint)
 
@@ -498,9 +529,10 @@ def print_summary(checkpoint: dict):
     for key, label in [
         ("total_processed", "Problems processed"),
         ("total_skipped_no_cot", "Skipped (no CoT)"),
-        ("total_no_rejected", "No rejected found"),
         ("total_api_calls", "Total API calls"),
         ("total_pairs_generated", "DPO pairs generated"),
+        ("total_fallback_pairs", "  of which fallback"),
+        ("total_no_rejected", "No rejected found"),
     ]:
         val = checkpoint.get(key, "N/A")
         print(f"  {label}: {val}", file=sys.stderr)
