@@ -246,12 +246,18 @@ def main():
         args.base_model, args.checkpoint, merge_lora=MERGE_LORA_BEFORE_DPO,
     )
 
+    # Free GPU memory before training
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        print(f"GPU memory: {torch.cuda.memory_allocated()/1024**3:.1f} GiB allocated, "
+              f"{torch.cuda.memory_reserved()/1024**3:.1f} GiB reserved")
+
     # 3. DPO config
     training_args = DPOConfig(
         output_dir=args.output_dir,
         logging_steps=10,
-        per_device_train_batch_size=8,
-        per_device_eval_batch_size=8,
+        per_device_train_batch_size=2,   # small batch: DPO keeps policy + ref model in memory
+        per_device_eval_batch_size=2,
         num_train_epochs=args.epochs,
         learning_rate=args.lr,
         beta=args.beta,
@@ -265,7 +271,7 @@ def main():
         bf16=torch.cuda.is_available(),
         fp16=False,
         gradient_checkpointing=True,
-        gradient_accumulation_steps=2,
+        gradient_accumulation_steps=8,   # compensate smaller batch: effective batch = 2 × 8 = 16
         warmup_ratio=0.1,
         lr_scheduler_type="cosine",
     )
