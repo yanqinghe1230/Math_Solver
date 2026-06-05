@@ -7,13 +7,23 @@ Fine-tunes the already SFT-ed Qwen2.5-0.5B model on preference pairs
 to align reasoning towards correct CoT answers.
 
 Usage:
+    # Default: use only API-generated pairs (high diversity, ~284 pairs)
     python train_dpo.py
 
-Configuration: edit the paths and training args in the CONFIG section below.
+    # Use API + low-similarity fallback pairs
+    python train_dpo.py --filter-source all --max-similarity 0.7
+
+    # Use everything (not recommended)
+    python train_dpo.py --filter-source all --max-similarity 1.0
+
+Configuration: edit the paths in CONFIG section or use CLI flags.
 """
 
+import argparse
+import difflib
 import json
 import os
+import sys
 import torch
 from datasets import Dataset, DatasetDict
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -24,131 +34,125 @@ from trl import DPOConfig, DPOTrainer
 # CONFIG — edit these to match your environment
 # ============================================================
 
-# Base model (same as used in baseline SFT)
 BASE_MODEL_PATH = "./Qwen/Qwen2.5-0.5B-Instruct"
-
-# Baseline SFT LoRA checkpoint to load and merge before DPO
 BASELINE_CHECKPOINT_PATH = "./output/Qwen/checkpoint-3750"
-
-# DPO preference pairs
 DPO_DATA_PATH = "dpo_pairs.jsonl"
-
-# Output directory for DPO model
 OUTPUT_DIR = "./output/Qwen-DPO"
 
-# System instruction (same as train_cot.json; used during inference)
-# Set to None to omit system message from DPO prompts
 SYSTEM_INSTRUCTION = (
     "这是小学数学1-6年级的校内题目，无需进行分析，请直接输出数字答案，不带单位。"
 )
 
-# Train/validation split ratio
 VALID_SPLIT = 0.1
-
-# Whether to merge LoRA before DPO (recommended: True)
 MERGE_LORA_BEFORE_DPO = True
 
-# Maximum number of DPO pairs to use (None = all)
-MAX_PAIRS = None
 
 # ============================================================
-# DPO Training Arguments
+# Data Loading & Filtering
 # ============================================================
 
-training_args = DPOConfig(
-    output_dir=OUTPUT_DIR,
-    logging_steps=25,
-    per_device_train_batch_size=8,
-    per_device_eval_batch_size=8,
-    num_train_epochs=3,
-    learning_rate=5e-5,          # lower than SFT; DPO is sensitive to LR
-    beta=0.1,                    # DPO temperature; higher = closer to reference model
-    load_best_model_at_end=True,
-    metric_for_best_model="eval_loss",
-    save_strategy="epoch",
-    eval_strategy="epoch",
-    logging_dir=os.path.join(OUTPUT_DIR, "logs"),
-    report_to="none",            # change to "wandb" or "swanlab" if needed
-    remove_unused_columns=False,
-    bf16=torch.cuda.is_available(),
-    fp16=False,
-    gradient_checkpointing=True,
-    gradient_accumulation_steps=2,
-    warmup_ratio=0.1,
-    lr_scheduler_type="cosine",
-)
+def compute_similarity(chosen_text: str, rejected_text: str) -> float:
+    """SequenceMatcher ratio: 0.0 = completely different, 1.0 = identical."""
+    return difflib.SequenceMatcher(None, chosen_text, rejected_text).ratio()
 
 
-# ============================================================
-# Data Loading & Preparation
-# ============================================================
+def load_dpo_pairs(
+    path: str,
+    filter_source: str = "api",
+    max_similarity: float = 0.85,
+    max_pairs: int = None,
+) -> list[dict]:
+    """
+    Load and filter DPO pairs from JSONL.
 
-def load_dpo_pairs(path: str, max_pairs: int = None) -> list[dict]:
-    """Load DPO pairs from a JSONL file."""
-    pairs = []
+    Args:
+        path: Path to dpo_pairs.jsonl.
+        filter_source: "api" (only API-generated), "fallback" (only programmatic),
+                       "all" (everything).
+        max_similarity: Discard pairs with similarity >= this threshold.
+                        API pairs avg ~0.24, fallback pairs avg ~0.93.
+                        Default 0.85 keeps diverse pairs, drops near-identical ones.
+        max_pairs: Hard cap on total pairs.
+
+    Returns:
+        Filtered list of valid DPO pair dicts.
+    """
+    raw = []
     with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
-                pairs.append(json.loads(line))
-    if max_pairs is not None and max_pairs > 0:
-        pairs = pairs[:max_pairs]
-    print(f"Loaded {len(pairs)} DPO pairs from {path}")
-    return pairs
+                raw.append(json.loads(line))
+
+    # Filter: must have prompt/chosen/rejected
+    valid = [p for p in raw if all(k in p for k in ("prompt", "chosen", "rejected"))]
+
+    # Filter by source
+    if filter_source != "all":
+        valid = [p for p in valid if p.get("metadata", {}).get("source") == filter_source]
+
+    # Filter by similarity
+    filtered = []
+    dropped_similar = 0
+    for p in valid:
+        c = p["chosen"][0]["content"]
+        r = p["rejected"][0]["content"]
+        sim = compute_similarity(c, r)
+        if sim < max_similarity:
+            p["_similarity"] = round(sim, 4)
+            filtered.append(p)
+        else:
+            dropped_similar += 1
+
+    # Print stats
+    source_counts = {}
+    sims = []
+    for p in filtered:
+        src = p.get("metadata", {}).get("source", "?")
+        source_counts[src] = source_counts.get(src, 0) + 1
+        sims.append(p.get("_similarity", 0))
+
+    print(f"Raw records: {len(raw)}, Valid DPO triples: {len(valid)}")
+    print(f"After source filter ({filter_source}): {len(filtered) + dropped_similar}")
+    print(f"After similarity filter (<{max_similarity}): {len(filtered)} "
+          f"(dropped {dropped_similar} near-identical pairs)")
+    if sims:
+        print(f"Similarity range: {min(sims):.3f} - {max(sims):.3f}, avg: {sum(sims)/len(sims):.3f}")
+    print(f"Source breakdown: {source_counts}")
+
+    # Hard cap
+    if max_pairs and len(filtered) > max_pairs:
+        filtered = filtered[:max_pairs]
+        print(f"Capped to {max_pairs} pairs")
+
+    return filtered
 
 
 def add_system_message(example: dict, instruction: str) -> dict:
-    """
-    Prepend a system message to the prompt for consistency with the
-    baseline SFT training and inference chat template.
-
-    Before: prompt = [{"role": "user", "content": "..."}]
-    After:  prompt = [{"role": "system", "content": "..."},
-                      {"role": "user", "content": "..."}]
-    """
+    """Prepend system message to prompt for consistency with inference format."""
     system_msg = {"role": "system", "content": instruction}
     example["prompt"] = [system_msg] + example["prompt"]
     return example
 
 
 def build_dataset(pairs: list[dict], instruction: str = None) -> DatasetDict:
-    """
-    Convert raw DPO pairs to a HuggingFace DatasetDict with train/valid split.
-
-    Each pair already has the correct DPO format:
-        {"prompt": [...], "chosen": [...], "rejected": [...]}
-    """
-    # Keep only valid DPO triples (skip placeholder records without chosen/rejected)
+    """Convert filtered pairs to HuggingFace DatasetDict with train/valid split."""
     records = []
-    skipped = 0
     for p in pairs:
-        if not all(k in p for k in ("prompt", "chosen", "rejected")):
-            skipped += 1
-            continue
         rec = {
             "prompt": p["prompt"],
             "chosen": p["chosen"],
             "rejected": p["rejected"],
         }
-        # Optionally add system message
         if instruction:
             rec = add_system_message(rec, instruction)
         records.append(rec)
 
-    if skipped:
-        print(f"Skipped {skipped} invalid records (missing prompt/chosen/rejected)")
-
     dataset = Dataset.from_list(records)
-
-    # Shuffle and split
     dataset = dataset.shuffle(seed=42)
     split = dataset.train_test_split(test_size=VALID_SPLIT, seed=42)
 
-    dataset_dict = DatasetDict({
-        "train": split["train"],
-        "valid": split["test"],
-    })
-
+    dataset_dict = DatasetDict({"train": split["train"], "valid": split["test"]})
     print(f"Train: {len(dataset_dict['train'])} pairs, Valid: {len(dataset_dict['valid'])} pairs")
     return dataset_dict
 
@@ -157,30 +161,12 @@ def build_dataset(pairs: list[dict], instruction: str = None) -> DatasetDict:
 # Model Loading
 # ============================================================
 
-def load_model_and_tokenizer(
-    base_model_path: str,
-    checkpoint_path: str = None,
-    merge_lora: bool = True,
-):
-    """
-    Load the base model, optionally apply + merge LoRA adapter, return model & tokenizer.
-
-    Args:
-        base_model_path: Path to Qwen2.5-0.5B-Instruct base model.
-        checkpoint_path: Path to LoRA adapter checkpoint, or None to skip.
-        merge_lora: If True, merge LoRA weights into the base model before returning.
-
-    Returns:
-        (model, tokenizer)
-    """
-    print(f"Loading base model from: {base_model_path}")
+def load_model_and_tokenizer(base_model_path, checkpoint_path=None, merge_lora=True):
+    print(f"Loading base model: {base_model_path}")
 
     tokenizer = AutoTokenizer.from_pretrained(
-        base_model_path,
-        use_fast=False,
-        trust_remote_code=True,
+        base_model_path, use_fast=False, trust_remote_code=True,
     )
-    # Qwen tokenizer doesn't have a default pad token
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -191,21 +177,16 @@ def load_model_and_tokenizer(
         trust_remote_code=True,
     )
 
-    # Load LoRA adapter from baseline SFT checkpoint
     if checkpoint_path and os.path.exists(checkpoint_path):
-        print(f"Loading LoRA adapter from: {checkpoint_path}")
+        print(f"Loading LoRA adapter: {checkpoint_path}")
         model = PeftModel.from_pretrained(model, checkpoint_path)
-
         if merge_lora:
-            print("Merging LoRA weights into base model...")
+            print("Merging LoRA into base model...")
             model = model.merge_and_unload()
-            print("LoRA merged successfully.")
-    else:
-        if checkpoint_path:
-            print(f"WARNING: Checkpoint not found at {checkpoint_path}, using base model only.")
+    elif checkpoint_path:
+        print(f"WARNING: checkpoint not found at {checkpoint_path}")
 
-    model.enable_input_require_grads()  # Required for gradient checkpointing
-
+    model.enable_input_require_grads()
     return model, tokenizer
 
 
@@ -214,22 +195,82 @@ def load_model_and_tokenizer(
 # ============================================================
 
 def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
-    print(f"Output directory: {OUTPUT_DIR}")
+    parser = argparse.ArgumentParser(description="DPO fine-tuning for math solver")
+    parser.add_argument("--filter-source", default="api",
+                        choices=["api", "fallback", "all"],
+                        help="Which source of pairs to use (default: api)")
+    parser.add_argument("--max-similarity", type=float, default=0.85,
+                        help="Drop pairs with similarity >= this (default: 0.85)")
+    parser.add_argument("--max-pairs", type=int, default=None,
+                        help="Hard cap on total pairs")
+    parser.add_argument("--epochs", type=int, default=1,
+                        help="Training epochs (default: 1)")
+    parser.add_argument("--lr", type=float, default=5e-6,
+                        help="Learning rate (default: 5e-6)")
+    parser.add_argument("--beta", type=float, default=0.3,
+                        help="DPO beta: higher = more conservative (default: 0.3)")
+    parser.add_argument("--output-dir", default=OUTPUT_DIR,
+                        help="Model output directory")
+    parser.add_argument("--base-model", default=BASE_MODEL_PATH)
+    parser.add_argument("--checkpoint", default=BASELINE_CHECKPOINT_PATH)
+    parser.add_argument("--data-path", default=DPO_DATA_PATH)
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Show data stats without training")
+    args = parser.parse_args()
 
-    # 1. Load and prepare data
-    pairs = load_dpo_pairs(DPO_DATA_PATH, max_pairs=MAX_PAIRS)
-    dataset = build_dataset(pairs, instruction=SYSTEM_INSTRUCTION)
+    print(f"Device: {'cuda' if torch.cuda.is_available() else 'cpu'}")
+    print(f"Output: {args.output_dir}")
+    print(f"Filter: source={args.filter_source}, max_similarity={args.max_similarity}")
+    print(f"Training: epochs={args.epochs}, lr={args.lr}, beta={args.beta}")
 
-    # 2. Load model (base + merged LoRA from baseline SFT)
-    model, tokenizer = load_model_and_tokenizer(
-        base_model_path=BASE_MODEL_PATH,
-        checkpoint_path=BASELINE_CHECKPOINT_PATH,
-        merge_lora=MERGE_LORA_BEFORE_DPO,
+    # 1. Load + filter data
+    pairs = load_dpo_pairs(
+        args.data_path,
+        filter_source=args.filter_source,
+        max_similarity=args.max_similarity,
+        max_pairs=args.max_pairs,
     )
 
-    # 3. Initialize DPOTrainer
+    if len(pairs) == 0:
+        print("ERROR: No pairs remain after filtering. Relax --filter-source or --max-similarity.")
+        sys.exit(1)
+
+    if args.dry_run:
+        print("\nDry run complete. Use --dry-run False to train.")
+        return
+
+    dataset = build_dataset(pairs, instruction=SYSTEM_INSTRUCTION)
+
+    # 2. Load model
+    model, tokenizer = load_model_and_tokenizer(
+        args.base_model, args.checkpoint, merge_lora=MERGE_LORA_BEFORE_DPO,
+    )
+
+    # 3. DPO config
+    training_args = DPOConfig(
+        output_dir=args.output_dir,
+        logging_steps=10,
+        per_device_train_batch_size=8,
+        per_device_eval_batch_size=8,
+        num_train_epochs=args.epochs,
+        learning_rate=args.lr,
+        beta=args.beta,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        save_strategy="epoch",
+        eval_strategy="epoch",
+        logging_dir=os.path.join(args.output_dir, "logs"),
+        report_to="none",
+        remove_unused_columns=False,
+        bf16=torch.cuda.is_available(),
+        fp16=False,
+        gradient_checkpointing=True,
+        gradient_accumulation_steps=2,
+        warmup_ratio=0.1,
+        lr_scheduler_type="cosine",
+    )
+
+    # 4. Train
     trainer = DPOTrainer(
         model=model,
         args=training_args,
@@ -238,14 +279,13 @@ def main():
         eval_dataset=dataset["valid"],
     )
 
-    # 4. Train
-    print("\nStarting DPO training...")
+    print(f"\nStarting DPO training with {len(dataset['train'])} pairs...")
     trainer.train()
 
-    # 5. Save final model
-    print(f"\nSaving model to {OUTPUT_DIR}")
-    trainer.save_model(OUTPUT_DIR)
-    tokenizer.save_pretrained(OUTPUT_DIR)
+    # 5. Save
+    print(f"\nSaving model to {args.output_dir}")
+    trainer.save_model(args.output_dir)
+    tokenizer.save_pretrained(args.output_dir)
     print("Done.")
 
 
