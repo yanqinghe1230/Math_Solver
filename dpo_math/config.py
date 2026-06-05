@@ -20,32 +20,25 @@ OUTPUT_PATH = os.path.join(BASE_DIR, "dpo_pairs.jsonl")
 SAMPLE_SIZE = 0  # Number of problems to process (0 = all)
 RANDOM_SEED = 42
 
-# --- DeepSeek API ---
-DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-DEEPSEEK_MODEL = "deepseek-chat"
-DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY"
-MAX_TOKENS = 1024
-TEMPERATURE = 0.9  # High temperature for variant generation
+# --- Zhipu (智谱) API ---
+ZHIPU_BASE_URL = "https://open.bigmodel.cn/api/paas/v4/"
+ZHIPU_MODEL = "glm-4-flash"
+ZHIPU_API_KEY_ENV = "ZHIPU_API_KEY"
+MAX_TOKENS = 512  # Limit COT length (was 1024)
+TEMPERATURE = 0.8  # Moderate temperature for plausible student errors
 
 # --- Rate limiting ---
-MIN_DELAY_BETWEEN_CALLS = 1.2  # Seconds between API calls (conservative)
-MAX_RETRIES = 3
-RETRY_BASE_DELAY = 2.0  # Base delay for exponential backoff
+MIN_DELAY_BETWEEN_CALLS = 0.5  # Seconds between API calls (Zhipu is faster)
+MAX_RETRIES = 1  # No retry on API failure — one attempt per problem
+RETRY_BASE_DELAY = 1.0  # Base delay for backoff
 
 # --- Checkpoint ---
 SAVE_INTERVAL = 50  # Save checkpoint every N problems
 
 # --- Generation ---
-STRATEGIES_PER_PROBLEM = 3  # Strategies tried per problem (increased for higher error yield)
-MAX_RETRY_ROUNDS = 2  # If no rejected answer found, retry with new strategies up to this many rounds
+# Single strategy, single round — one API call per problem as required
+STRATEGIES_PER_PROBLEM = 1
+MAX_RETRY_ROUNDS = 1
 
-# Strategy weights for random selection (Strategy B weighted 2x)
-STRATEGY_WEIGHTS = {
-    "high_temp": 1,
-    "student_mistake": 2,
-    "rushed": 1,
-    "alternative": 1,
-}
-
-# --- Quality filters ---
+# Quality filters
 MIN_RESPONSE_LENGTH = 30  # Minimum characters for a valid generated response

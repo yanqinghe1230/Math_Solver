@@ -2,13 +2,13 @@
 """
 DPO Candidate Answer Generator.
 
-Generates variant (potentially wrong) math CoT answers using the DeepSeek API.
+Generates variant (wrong) math CoT answers using the Zhipu (智谱) API.
 Uses the existing correct CoT from train_cot.json as "chosen", and API-generated
 answers with errors as "rejected" candidates for DPO training.
 
-For each problem, the script tries multiple prompt strategies to generate wrong
-answers. If the first round fails to produce a wrong answer, it retries with
-different strategies (up to MAX_RETRY_ROUNDS) to maximize coverage.
+For each problem, the script sends the question + correct CoT to the API with
+a prompt that simulates a weaker student making a key error. Each problem is
+called exactly once — no retries.
 
 Usage:
     # Dry-run: test with 5 problems
@@ -26,8 +26,8 @@ Usage:
     # Process sequentially (no shuffle)
     python generate_candidates.py --no-shuffle
 
-    # Use a different DeepSeek model
-    python generate_candidates.py --model deepseek-chat
+    # Use a different Zhipu model
+    python generate_candidates.py --model glm-4-flash
 """
 
 import argparse
@@ -49,24 +49,24 @@ from config import (
     OUTPUT_PATH,
     SAMPLE_SIZE,
     RANDOM_SEED,
-    DEEPSEEK_BASE_URL,
-    DEEPSEEK_MODEL,
-    DEEPSEEK_API_KEY_ENV,
+    ZHIPU_BASE_URL,
+    ZHIPU_MODEL,
+    ZHIPU_API_KEY_ENV,
     MAX_TOKENS,
     MIN_DELAY_BETWEEN_CALLS,
     MAX_RETRIES,
     RETRY_BASE_DELAY,
     SAVE_INTERVAL,
-    STRATEGIES_PER_PROBLEM,
-    STRATEGY_WEIGHTS,
-    MAX_RETRY_ROUNDS,
     MIN_RESPONSE_LENGTH,
 )
-from prompts import build_messages, get_strategy_temperature, STRATEGIES
+from prompts import build_messages, get_strategy_temperature
 from answer_verifier import extract_final_answer, extract_ground_truth, is_answer_wrong, generate_wrong_cot
 
 # Load .env file
 load_dotenv()
+
+# Strategy name (constant — single strategy)
+STRATEGY_NAME = "weak_student"
 
 
 # ── Logging ──
@@ -109,25 +109,25 @@ def save_checkpoint(checkpoint: dict):
 # ── API Client ──
 
 def create_client() -> OpenAI:
-    """Create OpenAI-compatible DeepSeek client."""
-    api_key = os.getenv(DEEPSEEK_API_KEY_ENV)
+    """Create OpenAI-compatible Zhipu (智谱) client."""
+    api_key = os.getenv(ZHIPU_API_KEY_ENV)
     if not api_key:
         raise RuntimeError(
-            f"API key not found. Set {DEEPSEEK_API_KEY_ENV} environment variable "
-            f"or create a .env file with: {DEEPSEEK_API_KEY_ENV}=your_key_here"
+            f"API key not found. Set {ZHIPU_API_KEY_ENV} environment variable "
+            f"or create a .env file with: {ZHIPU_API_KEY_ENV}=your_key_here"
         )
-    return OpenAI(base_url=DEEPSEEK_BASE_URL, api_key=api_key)
+    return OpenAI(base_url=ZHIPU_BASE_URL, api_key=api_key)
 
 
 def call_api(
     client: OpenAI,
     messages: list[dict],
     temperature: float,
-    model: str = DEEPSEEK_MODEL,
+    model: str = ZHIPU_MODEL,
     max_retries: int = MAX_RETRIES,
 ) -> Optional[str]:
     """
-    Call DeepSeek API with exponential backoff retry.
+    Call Zhipu API with simple retry on failure.
 
     Returns response text, or None on persistent failure.
     """
@@ -149,7 +149,7 @@ def call_api(
                 log(f"  Rate limited, waiting {wait:.1f}s (attempt {attempt+1}/{max_retries})")
                 time.sleep(wait)
             # Server error — wait and retry
-            elif err_msg and "5" in err_msg[:10] if len(err_msg) > 10 else False:
+            elif "5" in err_msg[:10] if len(err_msg) >= 10 else "5" in err_msg:
                 wait = RETRY_BASE_DELAY * (2 ** attempt)
                 log(f"  Server error, waiting {wait:.1f}s (attempt {attempt+1}/{max_retries})")
                 time.sleep(wait)
@@ -181,70 +181,30 @@ def has_valid_cot(answer: str) -> bool:
     return "推理过程" in answer and len(answer) >= 50
 
 
-# ── Strategy selection ──
+# ── Single API call per problem ──
 
-def select_strategies(n: int, exclude: list[str] = None) -> list[str]:
-    """
-    Randomly select N strategies weighted by STRATEGY_WEIGHTS.
-
-    Args:
-        n: Number of strategies to select.
-        exclude: Strategies to exclude from selection (for retry variety).
-
-    Returns selected strategy names.
-    """
-    strategies = list(STRATEGY_WEIGHTS.keys())
-    weights = list(STRATEGY_WEIGHTS.values())
-
-    # Exclude specified strategies
-    if exclude:
-        filtered = [(s, w) for s, w in zip(strategies, weights) if s not in exclude]
-        if not filtered:
-            # All excluded — fall back to all strategies
-            filtered = list(zip(strategies, weights))
-        strategies, weights = zip(*filtered)
-
-    strategies = list(strategies)
-    weights = list(weights)
-
-    # Weighted sample without replacement
-    chosen = []
-    remaining_s = list(strategies)
-    remaining_w = list(weights)
-    for _ in range(min(n, len(strategies))):
-        if not remaining_s:
-            break
-        total_w = sum(remaining_w)
-        probs = [w / total_w for w in remaining_w]
-        idx = random.choices(range(len(remaining_s)), weights=probs, k=1)[0]
-        chosen.append(remaining_s.pop(idx))
-        remaining_w.pop(idx)
-    return chosen
-
-
-# ── Single strategy call ──
-
-def try_strategy(
+def try_generate_wrong(
     client: OpenAI,
     question: str,
+    correct_cot: str,
     ground_truth: str,
-    strategy: str,
     model: str,
 ) -> dict:
     """
-    Call the API with a single strategy and evaluate the result.
+    Call the API once to generate a wrong-answer variant.
 
+    Sends the question + correct CoT to the model with the weak-student prompt.
     Returns a generation record dict.
     """
-    temperature = get_strategy_temperature(strategy)
-    messages = build_messages(question, strategy)
+    temperature = get_strategy_temperature()
+    messages = build_messages(question, correct_cot)
 
     time.sleep(MIN_DELAY_BETWEEN_CALLS)
     response_text = call_api(client, messages, temperature, model=model)
 
     if response_text is None:
         return {
-            "strategy": strategy,
+            "strategy": STRATEGY_NAME,
             "temperature": temperature,
             "generated_text": None,
             "extracted_answer": None,
@@ -274,7 +234,7 @@ def try_strategy(
         status = "possibly_truncated"
 
     return {
-        "strategy": strategy,
+        "strategy": STRATEGY_NAME,
         "temperature": temperature,
         "generated_text": response_text,
         "extracted_answer": extracted,
@@ -289,23 +249,20 @@ def generate(
     problems: list[dict],
     client: OpenAI,
     start_index: int = 0,
-    model: str = DEEPSEEK_MODEL,
-    strategies_per_problem: int = STRATEGIES_PER_PROBLEM,
-    max_retry_rounds: int = MAX_RETRY_ROUNDS,
+    model: str = ZHIPU_MODEL,
 ) -> dict:
     """
     Process problems and generate DPO candidate pairs.
 
-    For each problem, tries up to max_retry_rounds to get at least one
-    rejected (wrong) answer. Each round uses different strategies.
+    For each problem, sends one API request with the question + correct CoT
+    and the weak-student prompt. Falls back to programmatic wrong-answer
+    generation if the API call fails.
 
     Args:
         problems: List of problem dicts from train_cot.json.
-        client: OpenAI-compatible client for DeepSeek.
+        client: OpenAI-compatible client for Zhipu.
         start_index: Index to resume from.
-        model: DeepSeek model name.
-        strategies_per_problem: Strategies to try per round.
-        max_retry_rounds: Max retry rounds if no rejected answer found.
+        model: Zhipu model name.
 
     Returns:
         Final checkpoint dict with statistics.
@@ -332,7 +289,8 @@ def generate(
     end_index = start_index + total_problems - 1
 
     log(f"Starting from index {start_index}, {total_problems} problems to process")
-    log(f"Resume: {processed} done, {total_api_calls} API calls, {total_pairs} pairs")
+    log(f"Resume: {processed} done, {total_api_calls} API calls, {total_pairs} pairs "
+        f"({fallback_pairs} fallback)")
 
     for i, record in enumerate(problems):
         problem_idx = start_index + i
@@ -350,7 +308,6 @@ def generate(
             log(f"[{problem_idx}/{end_index}] SKIP {problem_id}: no valid CoT reasoning")
             skipped_no_cot += 1
             processed += 1
-            # Still write a minimal candidate record for tracking
             candidates_file.write(json.dumps({
                 "id": problem_id, "question": question,
                 "ground_truth_answer": None, "ground_truth_cot": answer_full,
@@ -383,53 +340,28 @@ def generate(
 
         log(f"[{problem_idx}/{end_index}] {problem_id}: {question[:60]}...")
 
-        # ── Multi-round generation with retry ──
-        all_generations = []
-        rejected_candidates = []
-        tried_strategies = set()
-        round_num = 0  # track outside loop
+        # ── Single API call per problem ──
+        total_api_calls += 1
+        gen_record = try_generate_wrong(client, question, answer_full, ground_truth, model)
+        all_generations = [gen_record]
 
-        for round_num in range(max_retry_rounds):
-            # Select fresh strategies (exclude already-tried ones within this problem)
-            chosen = select_strategies(strategies_per_problem, exclude=list(tried_strategies))
-            if not chosen:
-                log(f"  All strategies exhausted for this problem")
-                break
-
-            tried_strategies.update(chosen)
-            round_label = f"R{round_num+1}" if round_num > 0 else "R1"
-            log(f"  [{round_label}] Strategies: {chosen}")
-
-            round_rejected = []
-
-            for strategy in chosen:
-                total_api_calls += 1
-                gen_record = try_strategy(client, question, ground_truth, strategy, model)
-                gen_record["round"] = round_num + 1
-                all_generations.append(gen_record)
-
-                status = gen_record["status"]
-                if status == "rejected_candidate":
-                    extracted = gen_record["extracted_answer"]
-                    log(f"    [{strategy}] ✓ WRONG: {extracted} (gt: {ground_truth})")
-                    round_rejected.append(gen_record)
-                elif status == "same_answer":
-                    log(f"    [{strategy}] correct (same as gt)")
-                elif status == "api_failed":
-                    log(f"    [{strategy}] API FAILED")
-                else:
-                    log(f"    [{strategy}] {status}")
-
-            rejected_candidates.extend(round_rejected)
-
-            # Stop retrying once we have at least one rejected candidate
-            if rejected_candidates:
-                break
+        status = gen_record["status"]
+        if status == "rejected_candidate":
+            extracted = gen_record["extracted_answer"]
+            log(f"  ✓ WRONG: {extracted} (gt: {ground_truth})")
+        elif status == "same_answer":
+            log(f"  correct (same as gt)")
+        elif status == "api_failed":
+            log(f"  API FAILED")
+        else:
+            log(f"  {status}")
 
         # ── Determine rejected source ──
-        if rejected_candidates:
+        if gen_record["is_wrong"] is True:
+            rejected_candidates = [gen_record]
             rejected_source = "api"
         else:
+            rejected_candidates = []
             # ── Fallback: programmatically generate a wrong CoT ──
             wrong_cot = generate_wrong_cot(answer_full)
             if wrong_cot:
@@ -457,7 +389,6 @@ def generate(
             "ground_truth_answer": ground_truth,
             "ground_truth_cot": answer_full,
             "generations": all_generations,
-            "total_rounds": round_num + 1,
             "has_rejected": len(rejected_candidates) > 0,
             "rejected_source": rejected_source,
         }
@@ -484,7 +415,7 @@ def generate(
             total_pairs += 1
         else:
             no_rejected += 1
-            log(f"  ⚠ NO REJECTED after {round_num+1} round(s), {len(all_generations)} attempts")
+            log(f"  ⚠ NO REJECTED: API call did not produce a wrong answer")
 
         processed += 1
 
@@ -539,72 +470,62 @@ def print_summary(checkpoint: dict):
     print(f"  Candidates file: {CANDIDATES_PATH}", file=sys.stderr)
     print(f"  DPO pairs file:  {OUTPUT_PATH}", file=sys.stderr)
 
-    # Per-strategy stats
+    # Per-status stats from candidates file
     if os.path.exists(CANDIDATES_PATH):
-        strategy_stats = {}
+        status_counts = {
+            "rejected_candidate": 0,
+            "same_answer": 0,
+            "unparseable": 0,
+            "api_failed": 0,
+            "too_short": 0,
+            "cannot_determine": 0,
+            "other": 0,
+        }
         total_gens = 0
+        api_gens = 0
         with open(CANDIDATES_PATH) as f:
             for line in f:
                 record = json.loads(line)
                 for gen in record.get("generations", []):
-                    s = gen.get("strategy", "unknown")
-                    status = gen.get("status", "unknown")
-                    if s not in strategy_stats:
-                        strategy_stats[s] = {"total": 0, "rejected": 0, "same": 0,
-                                             "unparseable": 0, "api_failed": 0, "other": 0}
-                    strategy_stats[s]["total"] += 1
+                    s = gen.get("status", "unknown")
+                    if gen.get("strategy") == STRATEGY_NAME:
+                        api_gens += 1
                     total_gens += 1
-                    if status == "rejected_candidate":
-                        strategy_stats[s]["rejected"] += 1
-                    elif status == "same_answer":
-                        strategy_stats[s]["same"] += 1
-                    elif status == "unparseable":
-                        strategy_stats[s]["unparseable"] += 1
-                    elif status == "api_failed":
-                        strategy_stats[s]["api_failed"] += 1
+                    if s in status_counts:
+                        status_counts[s] += 1
                     else:
-                        strategy_stats[s]["other"] += 1
+                        status_counts["other"] += 1
 
-        print("\n--- Per-Strategy Statistics ---", file=sys.stderr)
-        for s, stats in sorted(strategy_stats.items()):
-            desc = STRATEGIES.get(s, {}).get("description", s)
-            err_rate = 100 * stats["rejected"] / stats["total"] if stats["total"] > 0 else 0
-            print(f"  {s} ({desc}):", file=sys.stderr)
-            print(f"    Total={stats['total']}, Rejected={stats['rejected']} ({err_rate:.1f}%), "
-                  f"Same={stats['same']}, Unparseable={stats['unparseable']}, "
-                  f"Failed={stats['api_failed']}, Other={stats['other']}", file=sys.stderr)
+        print("\n--- Generation Statistics ---", file=sys.stderr)
+        print(f"  Total generations: {total_gens}", file=sys.stderr)
+        print(f"  API generations: {api_gens}", file=sys.stderr)
+        for s, count in sorted(status_counts.items()):
+            if count > 0:
+                print(f"    {s}: {count}", file=sys.stderr)
 
-        if total_gens > 0:
-            total_rejected = sum(s['rejected'] for s in strategy_stats.values())
-            print(f"\n  Overall rejected rate: {100 * total_rejected / total_gens:.1f}% "
-                  f"({total_rejected}/{total_gens})", file=sys.stderr)
+        if api_gens > 0:
+            err_rate = 100 * status_counts["rejected_candidate"] / api_gens
+            print(f"\n  API rejected rate: {err_rate:.1f}% "
+                  f"({status_counts['rejected_candidate']}/{api_gens})", file=sys.stderr)
 
 
 # ── CLI ──
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate DPO candidate answers for math problems using DeepSeek API"
+        description="Generate DPO candidate answers for math problems using Zhipu (智谱) API"
     )
     parser.add_argument(
         "--sample-size", type=int, default=SAMPLE_SIZE,
         help=f"Number of problems to process (0=all, default: {SAMPLE_SIZE})"
     )
     parser.add_argument(
-        "--strategies-per-problem", type=int, default=STRATEGIES_PER_PROBLEM,
-        help=f"Strategies per round (default: {STRATEGIES_PER_PROBLEM})"
-    )
-    parser.add_argument(
-        "--max-retry-rounds", type=int, default=MAX_RETRY_ROUNDS,
-        help=f"Max retry rounds if no rejected (default: {MAX_RETRY_ROUNDS})"
-    )
-    parser.add_argument(
         "--start", type=int, default=None,
         help="Start index for resume (overrides checkpoint)"
     )
     parser.add_argument(
-        "--model", type=str, default=DEEPSEEK_MODEL,
-        help=f"DeepSeek model name (default: {DEEPSEEK_MODEL})"
+        "--model", type=str, default=ZHIPU_MODEL,
+        help=f"Zhipu model name (default: {ZHIPU_MODEL})"
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -666,20 +587,17 @@ def main():
         f"(index {start_index} to {len(sample)-1})")
 
     # Create API client
-    log(f"Connecting to DeepSeek API: {DEEPSEEK_BASE_URL}")
+    log(f"Connecting to Zhipu API: {ZHIPU_BASE_URL}")
     log(f"Model: {model_name}")
     client = create_client()
 
     # Generate
-    log(f"Starting generation ({args.strategies_per_problem} strategies/problem, "
-        f"max {args.max_retry_rounds} retry rounds)...")
+    log("Starting generation (1 API call per problem, no retries)...")
     start_time = time.time()
     checkpoint = generate(
         problems_to_process, client,
         start_index=start_index,
         model=model_name,
-        strategies_per_problem=args.strategies_per_problem,
-        max_retry_rounds=args.max_retry_rounds,
     )
     elapsed = time.time() - start_time
     log(f"Generation completed in {elapsed/60:.1f} minutes "
