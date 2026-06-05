@@ -118,9 +118,13 @@ def build_dataset(pairs: list[dict], instruction: str = None) -> DatasetDict:
     Each pair already has the correct DPO format:
         {"prompt": [...], "chosen": [...], "rejected": [...]}
     """
-    # Keep only the DPO columns + metadata (metadata is ignored by DPOTrainer)
+    # Keep only valid DPO triples (skip placeholder records without chosen/rejected)
     records = []
+    skipped = 0
     for p in pairs:
+        if not all(k in p for k in ("prompt", "chosen", "rejected")):
+            skipped += 1
+            continue
         rec = {
             "prompt": p["prompt"],
             "chosen": p["chosen"],
@@ -130,6 +134,9 @@ def build_dataset(pairs: list[dict], instruction: str = None) -> DatasetDict:
         if instruction:
             rec = add_system_message(rec, instruction)
         records.append(rec)
+
+    if skipped:
+        print(f"Skipped {skipped} invalid records (missing prompt/chosen/rejected)")
 
     dataset = Dataset.from_list(records)
 
