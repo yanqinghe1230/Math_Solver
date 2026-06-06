@@ -7,20 +7,19 @@ Fine-tunes the already SFT-ed Qwen2.5-0.5B model on preference pairs
 to align reasoning towards correct CoT answers.
 
 Usage:
-    # Default: use only API-generated pairs (high diversity, ~284 pairs)
+    # Dry-run: show data stats
+    python train_dpo.py --dry-run
+
+    # Train with defaults
     python train_dpo.py
 
-    # Use API + low-similarity fallback pairs
-    python train_dpo.py --filter-source all --max-similarity 0.7
+    # Cap number of pairs
+    python train_dpo.py --max-pairs 2000
 
-    # Use everything (not recommended)
-    python train_dpo.py --filter-source all --max-similarity 1.0
-
-Configuration: edit the paths in CONFIG section or use CLI flags.
+Configuration: edit the CONFIG section or use CLI flags.
 """
 
 import argparse
-import difflib
 import json
 import os
 import sys
@@ -48,34 +47,22 @@ MERGE_LORA_BEFORE_DPO = True
 
 
 # ============================================================
-# Data Loading & Filtering
+# Data Loading
 # ============================================================
-
-def compute_similarity(chosen_text: str, rejected_text: str) -> float:
-    """SequenceMatcher ratio: 0.0 = completely different, 1.0 = identical."""
-    return difflib.SequenceMatcher(None, chosen_text, rejected_text).ratio()
-
 
 def load_dpo_pairs(
     path: str,
-    filter_source: str = "api",
-    max_similarity: float = 0.85,
     max_pairs: int = None,
 ) -> list[dict]:
     """
-    Load and filter DPO pairs from JSONL.
+    Load DPO pairs from JSONL. Only keeps records with prompt/chosen/rejected.
 
     Args:
         path: Path to dpo_pairs.jsonl.
-        filter_source: "api" (only API-generated), "fallback" (only programmatic),
-                       "all" (everything).
-        max_similarity: Discard pairs with similarity >= this threshold.
-                        API pairs avg ~0.24, fallback pairs avg ~0.93.
-                        Default 0.85 keeps diverse pairs, drops near-identical ones.
         max_pairs: Hard cap on total pairs.
 
     Returns:
-        Filtered list of valid DPO pair dicts.
+        List of valid DPO pair dicts.
     """
     raw = []
     with open(path, encoding="utf-8") as f:
@@ -87,45 +74,15 @@ def load_dpo_pairs(
     # Filter: must have prompt/chosen/rejected
     valid = [p for p in raw if all(k in p for k in ("prompt", "chosen", "rejected"))]
 
-    # Filter by source
-    if filter_source != "all":
-        valid = [p for p in valid if p.get("metadata", {}).get("source") == filter_source]
-
-    # Filter by similarity
-    filtered = []
-    dropped_similar = 0
-    for p in valid:
-        c = p["chosen"][0]["content"]
-        r = p["rejected"][0]["content"]
-        sim = compute_similarity(c, r)
-        if sim < max_similarity:
-            p["_similarity"] = round(sim, 4)
-            filtered.append(p)
-        else:
-            dropped_similar += 1
-
-    # Print stats
-    source_counts = {}
-    sims = []
-    for p in filtered:
-        src = p.get("metadata", {}).get("source", "?")
-        source_counts[src] = source_counts.get(src, 0) + 1
-        sims.append(p.get("_similarity", 0))
-
-    print(f"Raw records: {len(raw)}, Valid DPO triples: {len(valid)}")
-    print(f"After source filter ({filter_source}): {len(filtered) + dropped_similar}")
-    print(f"After similarity filter (<{max_similarity}): {len(filtered)} "
-          f"(dropped {dropped_similar} near-identical pairs)")
-    if sims:
-        print(f"Similarity range: {min(sims):.3f} - {max(sims):.3f}, avg: {sum(sims)/len(sims):.3f}")
-    print(f"Source breakdown: {source_counts}")
+    print(f"Raw records: {len(raw)}, Valid DPO triples: {len(valid)} "
+          f"(dropped {len(raw) - len(valid)} malformed)")
 
     # Hard cap
-    if max_pairs and len(filtered) > max_pairs:
-        filtered = filtered[:max_pairs]
+    if max_pairs and len(valid) > max_pairs:
+        valid = valid[:max_pairs]
         print(f"Capped to {max_pairs} pairs")
 
-    return filtered
+    return valid
 
 
 def add_system_message(example: dict, instruction: str) -> dict:
@@ -136,7 +93,7 @@ def add_system_message(example: dict, instruction: str) -> dict:
 
 
 def build_dataset(pairs: list[dict], instruction: str = None) -> DatasetDict:
-    """Convert filtered pairs to HuggingFace DatasetDict with train/valid split."""
+    """Convert pairs to HuggingFace DatasetDict with train/valid split."""
     records = []
     for p in pairs:
         rec = {
@@ -196,11 +153,6 @@ def load_model_and_tokenizer(base_model_path, checkpoint_path=None, merge_lora=T
 
 def main():
     parser = argparse.ArgumentParser(description="DPO fine-tuning for math solver")
-    parser.add_argument("--filter-source", default="api",
-                        choices=["api", "fallback", "all"],
-                        help="Which source of pairs to use (default: api)")
-    parser.add_argument("--max-similarity", type=float, default=0.85,
-                        help="Drop pairs with similarity >= this (default: 0.85)")
     parser.add_argument("--max-pairs", type=int, default=None,
                         help="Hard cap on total pairs")
     parser.add_argument("--epochs", type=int, default=1,
@@ -220,23 +172,20 @@ def main():
 
     print(f"Device: {'cuda' if torch.cuda.is_available() else 'cpu'}")
     print(f"Output: {args.output_dir}")
-    print(f"Filter: source={args.filter_source}, max_similarity={args.max_similarity}")
     print(f"Training: epochs={args.epochs}, lr={args.lr}, beta={args.beta}")
 
-    # 1. Load + filter data
+    # 1. Load data
     pairs = load_dpo_pairs(
         args.data_path,
-        filter_source=args.filter_source,
-        max_similarity=args.max_similarity,
         max_pairs=args.max_pairs,
     )
 
     if len(pairs) == 0:
-        print("ERROR: No pairs remain after filtering. Relax --filter-source or --max-similarity.")
+        print("ERROR: No valid pairs found. Check dpo_pairs.jsonl.")
         sys.exit(1)
 
     if args.dry_run:
-        print("\nDry run complete. Use --dry-run False to train.")
+        print(f"\nDry run complete. {len(pairs)} pairs ready for training.")
         return
 
     dataset = build_dataset(pairs, instruction=SYSTEM_INSTRUCTION)
