@@ -19,8 +19,8 @@ def main():
     parser.add_argument("--output-path", default="submit_dpo.csv")
     parser.add_argument("--batch-size", type=int, default=32,
                         help="批量推理大小（默认 32）")
-    parser.add_argument("--max-new-tokens", type=int, default=128,
-                        help="最大生成 token 数（需要容纳 CoT 推理过程，默认 128）")
+    parser.add_argument("--max-new-tokens", type=int, default=1024,
+                        help="最大生成 token 数（安全上限，正常情况模型生成完会自动停）")
     parser.add_argument("--raw", action="store_true",
                         help="输出原始 CoT 文本（不提取答案）")
     args = parser.parse_args()
