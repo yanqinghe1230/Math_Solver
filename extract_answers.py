@@ -8,10 +8,46 @@ Usage:
 import argparse
 import csv
 import os
+import re
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from dpo_math.answer_verifier import extract_final_answer
+
+def extract_answer(text: str) -> str:
+    """
+    从模型原始 CoT 输出中提取最终答案。
+
+    支持的格式：
+      ### 最终答案 3920         (同行)
+      ### 最终答案\\n3920        (换行)
+      答案是/答案为/答：3920
+    """
+    if not text or not text.strip():
+        return ""
+
+    # 1. ### 最终答案 后面跟空格/换行
+    m = re.search(r'#*\s*最终答案\s*[\n\s]+(.+?)(?:\n|$)', text)
+    if m:
+        val = m.group(1).strip()
+        if val:
+            return val
+
+    # 2. 答案是/答案为/答：
+    m = re.search(r'(?:答案(?:是|为)|答)[：:]\s*(.+?)(?:\n|$)', text)
+    if m:
+        return m.group(1).strip()
+
+    # 3. 最后一个 = 后面的数字
+    m = re.findall(r'=\s*(\d+(?:\.\d+)?)', text)
+    if m:
+        return m[-1]
+
+    # 4. 最后一段非空文本
+    parts = re.split(r'[\n#]+', text)
+    parts = [p.strip() for p in parts if p.strip()]
+    if parts:
+        return parts[-1]
+
+    return text.strip()
 
 
 def main():
@@ -25,9 +61,6 @@ def main():
         sys.exit(1)
 
     total = 0
-    extracted = 0
-    fallback = 0
-
     with open(args.input, encoding="utf-8") as inf, \
          open(args.output, "w", encoding="utf-8") as outf:
         reader = csv.reader(inf)
@@ -38,18 +71,10 @@ def main():
             problem_id = row[0]
             raw_text = row[1]
 
-            answer = extract_final_answer(raw_text)
-            if answer is not None:
-                extracted += 1
-            else:
-                fallback += 1
-                # 回退：取最后一行非空文本
-                lines = [l.strip() for l in raw_text.split("\n") if l.strip()]
-                answer = lines[-1] if lines else raw_text
-
+            answer = extract_answer(raw_text)
             outf.write(f"{problem_id},{answer}\n")
 
-    print(f"Total: {total}, Extracted: {extracted}, Fallback: {fallback}")
+    print(f"Total: {total}")
     print(f"Output: {args.output}")
 
 

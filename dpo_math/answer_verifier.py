@@ -52,14 +52,21 @@ def extract_final_answer(text: str) -> Optional[str]:
 
     text = text.strip()
 
-    # Pattern 1: ### 最终答案 followed by the answer on next line(s)
+    # Pattern 1: ### 最终答案 — answer on same line or next line
+    #   Cases: "### 最终答案\n3920" (multiline) or "### 最终答案 3920" (inline)
     m = re.search(r'#*\s*最终答案\s*\n\s*(.+?)\s*$', text, re.MULTILINE | re.DOTALL)
     if m:
         candidate = m.group(1).strip()
-        # Take the first meaningful line
         lines = [l.strip() for l in candidate.split('\n') if l.strip()]
         if lines:
             return _clean_answer_line(lines[0])
+
+    # Pattern 1b: ### 最终答案{space}{number} — inline, no newline
+    m = re.search(r'#*\s*最终答案\s+(.+?)(?:\n|$)', text)
+    if m:
+        answer = m.group(1).strip()
+        if answer and len(answer) < 50:
+            return _clean_answer_line(answer)
 
     # Pattern 2: 最终答案是/最終答案為
     m = re.search(r'最终答案[是为：:]\s*(.+?)(?:\n|$)', text)
